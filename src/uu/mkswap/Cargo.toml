@@ -1,0 +1,19 @@
+[package]
+name = "uu_mkswap"
+version = "0.0.1"
+edition = "2021"
+description = "mkswap - Setup a Linux swap area"
+
+[lib]
+path = "src/mkswap.rs"
+
+[[bin]]
+name = "mkswap"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+linux-raw-sys = { workspace = true }
+sysinfo = { workspace = true }
+uucore = { workspace = true, features = ["libc"] }
+uuid = { workspace = true, features = ["v4"] }

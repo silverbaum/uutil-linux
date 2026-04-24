@@ -87,6 +87,10 @@ mod test_hexdump;
 #[path = "by-util/test_mcookie.rs"]
 mod test_mcookie;
 
+#[cfg(feature = "mkswap")]
+#[path = "by-util/test_mkswap.rs"]
+mod test_mkswap;
+
 #[cfg(feature = "uuidgen")]
 #[path = "by-util/test_uuidgen.rs"]
 mod test_uuidgen;
