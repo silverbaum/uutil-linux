@@ -14,6 +14,5 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 linux-raw-sys = { workspace = true }
-sysinfo = { workspace = true }
 uucore = { workspace = true, features = ["libc"] }
 uuid = { workspace = true, features = ["v4"] }

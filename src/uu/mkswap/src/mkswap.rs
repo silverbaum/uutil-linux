@@ -131,16 +131,23 @@ mod linux {
                 let err = unsafe { ioctl(fd.as_raw_fd(), BLKGETSIZE64 as u64, &mut sz) };
 
                 if sz == 0 || err < 0 {
-                    /* TODO: cleaner manual size reading if ioctl fails */
                     let f_size = fs::File::open(format!("/sys/class/block/{devname}/size"))?;
 
-                    let reader = BufReader::new(f_size);
-                    let vec: Vec<Result<u64, _>> = reader
-                        .lines()
-                        .map(|v| v.unwrap().parse::<u64>())
-                        .collect::<Vec<Result<u64, _>>>();
-                    sz = vec[0].clone().unwrap_or(0);
-                    Ok(sz * 512)
+                    let mut reader = BufReader::new(f_size);
+                    let mut line = String::new();
+                    let bytes = reader.read_line(&mut line)?;
+                    if bytes == 0 {
+                        return Err(std::io::Error::other(format!(
+                            "empty size file for block device {devname}"
+                        )));
+                    }
+
+                    let sectors = line.trim().parse::<u64>().map_err(|e| {
+                        std::io::Error::other(format!(
+                            "Invalid size value for block device {devname}: {e}"
+                        ))
+                    })?;
+                    Ok(sectors.saturating_mul(512))
                 } else {
                     Ok(sz)
                 }
@@ -181,7 +188,7 @@ mod linux {
         Ok(fd)
     }
 
-    unsafe fn write_signature_page(
+    fn write_signature_page(
         pagesize: usize,
         pages: u32,
         uuid: Uuid,
@@ -193,6 +200,7 @@ mod linux {
             .label(label.to_owned())?
             .pages(pages)?
             .uuid(uuid);
+
         let header_bytes = unsafe {
             std::slice::from_raw_parts(
                 (&header as *const SwapHeader) as *const u8,
@@ -246,7 +254,7 @@ mod linux {
 
         let stat = fd.metadata()?;
         if stat.st_uid() != 0 {
-            println!(
+            eprintln!(
                 "mkswap: {}: insecure file owner {}, fix with: chown 0:0 {}",
                 device,
                 stat.st_uid(),
@@ -268,25 +276,23 @@ mod linux {
 
         let pages = (devsize / pagesize as u64) as u32;
 
-        let buf = unsafe {
-            match write_signature_page(pagesize, pages, uuid, label) {
-                Ok(buffer) => buffer,
-                Err(MkswapError::TooFewPages { pages: _ }) => {
-                    return Err(USimpleError::new(
-                        1,
-                        format!(
-                            "Device {} is too small for a swap area, minimum size is {}KiB",
-                            devname,
-                            (MIN_SWAP_PAGES * pagesize as u32) / 1024
-                        ),
-                    ));
-                }
-                Err(MkswapError::TooLongLabel) => {
-                    return Err(USimpleError::new(
-                        1,
-                        format!("{}", MkswapError::TooLongLabel),
-                    ));
-                }
+        let buf = match write_signature_page(pagesize, pages, uuid, label) {
+            Ok(buffer) => buffer,
+            Err(MkswapError::TooFewPages { pages: _ }) => {
+                return Err(USimpleError::new(
+                    1,
+                    format!(
+                        "Device {} is too small for a swap area, minimum size is {}KiB",
+                        devname,
+                        (MIN_SWAP_PAGES * pagesize as u32) / 1024
+                    ),
+                ));
+            }
+            Err(MkswapError::TooLongLabel) => {
+                return Err(USimpleError::new(
+                    1,
+                    format!("{}", MkswapError::TooLongLabel),
+                ));
             }
         };
 
@@ -327,7 +333,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 #[cfg(not(target_os = "linux"))]
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
-    let _matches: clap::ArgMatches = uu_app().try_get_matches_from(_args)?;
+    let _matches: clap::ArgMatches = uu_app().try_get_matches_from(args)?;
 
     Err(uucore::error::USimpleError::new(
         1,
@@ -365,6 +371,7 @@ pub fn uu_app() -> Command {
                 .short('F')
                 .long("file")
                 .action(ArgAction::SetTrue)
+                .requires("filesize")
                 .help("create a swap file"),
         )
         .arg(
@@ -374,6 +381,7 @@ pub fn uu_app() -> Command {
                 .action(ArgAction::Set)
                 .value_parser(clap::value_parser!(u64))
                 .value_name("SIZE")
+                .requires("file")
                 .help("size of the swap file in bytes"),
         )
         .arg(

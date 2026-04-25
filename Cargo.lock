@@ -1712,7 +1712,6 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "linux-raw-sys",
- "sysinfo",
  "uucore 0.2.2",
  "uuid",
 ]

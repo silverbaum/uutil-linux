@@ -61,7 +61,7 @@ mod linux {
             .succeeds()
             .code_is(0)
             .stdout_contains("Setting up swapspace version 1")
-            .stdout_contains("insecure file owner");
+            .stderr_contains("insecure file owner");
     }
 
     #[test]
@@ -139,6 +139,17 @@ mod linux {
         let sig = &buf[4086..];
         let swapsig = "SWAPSPACE2".as_bytes();
         assert_eq!(sig, swapsig);
+    }
+
+    #[test]
+    fn test_missing_required_args() {
+        new_ucmd!()
+            .arg("-F")
+            .arg("swapfile")
+            .fails()
+            .code_is(1)
+            .stderr_contains("the following required arguments were not provided:")
+            .stderr_contains("--size");
     }
 }
 #[cfg(not(target_os = "linux"))]
