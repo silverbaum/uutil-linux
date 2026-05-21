@@ -4,7 +4,7 @@
 // file that was distributed with this source code.
 
 use clap::{crate_version, Arg, ArgAction, ArgMatches, Command};
-use uucore::error::{set_exit_code, UResult, USimpleError, UUsageError};
+use uucore::error::{UResult, USimpleError};
 use uucore::{format_usage, help_about, help_usage};
 
 const ABOUT: &str = help_about!("mkswap.md");
@@ -29,7 +29,10 @@ mod linux {
     };
 
     use linux_raw_sys::ioctl::BLKGETSIZE64;
-    use uucore::libc::{ioctl, pread, sysconf, _SC_PAGESIZE, _SC_PAGE_SIZE};
+    use uucore::{
+        error::UUsageError,
+        libc::{ioctl, pread, sysconf, _SC_PAGESIZE, _SC_PAGE_SIZE},
+    };
     use uuid::Uuid;
 
     pub const SWAP_SIGNATURE: &[u8] = "SWAPSPACE2".as_bytes();
@@ -402,14 +405,12 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-use linux::*;
-
-#[cfg(target_os = "linux")]
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+    use linux::*;
     let matches: clap::ArgMatches = uu_app().try_get_matches_from(args)?;
     if let Err(e) = mkswap(&matches) {
-        set_exit_code(2);
+        uucore::error::set_exit_code(2);
         uucore::show_error!("{}", e);
     };
     Ok(())
@@ -418,12 +419,9 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 #[cfg(not(target_os = "linux"))]
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
-    let _matches: clap::ArgMatches = uu_app().try_get_matches_from(args)?;
+    let _matches: ArgMatches = uu_app().try_get_matches_from(args)?;
 
-    Err(uucore::error::USimpleError::new(
-        1,
-        "`mkswap` is available only on Linux.",
-    ))
+    Err(USimpleError::new(1, "`mkswap` is available only on Linux."))
 }
 
 pub fn uu_app() -> Command {
