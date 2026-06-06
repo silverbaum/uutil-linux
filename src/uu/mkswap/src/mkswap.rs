@@ -280,7 +280,7 @@ mod linux {
         let checkflag = matches.get_flag("check");
         let createflag = matches.get_flag("file");
         let pagesize_arg = matches
-            .try_get_one::<u64>("pagesize")
+            .try_get_one::<usize>("pagesize")
             .map_err(|e| USimpleError {
                 code: 1,
                 message: e.to_string(),
@@ -332,7 +332,13 @@ mod linux {
         };
 
         let pagesize = match pagesize_arg {
-            Some(sz) => *sz as usize, // TODO: check if its power of 2
+            Some(sz) => {
+                if sz.is_power_of_two() {
+                    *sz
+                } else {
+                    return Err(UUsageError::new(1, "Pagesize must be power of two"));
+                }
+            }
             None => getpagesize()?,
         };
         let devsize = if createflag {
@@ -486,8 +492,8 @@ pub fn uu_app() -> Command {
                 .short('p')
                 .long("pagesize")
                 .action(ArgAction::Set)
-                .value_parser(clap::value_parser!(u64))
+                .value_parser(clap::value_parser!(usize))
                 .help("specify page size in bytes"),
         )
-    // TODO: check, endianness, offset, force
+    // TODO: endianness, offset, force
 }
