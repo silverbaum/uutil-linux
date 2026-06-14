@@ -15,7 +15,7 @@ mod linux {
     use super::*;
     use std::{
         fmt::Debug,
-        fs::{self, File, Metadata},
+        fs::{File, Metadata, OpenOptions, Permissions},
         io::{BufRead, BufReader, Write},
         mem::size_of,
         os::{
@@ -40,8 +40,9 @@ mod linux {
     pub const SWAP_LABEL_LENGTH: usize = 16;
     pub const SWAP_VERSION: u32 = 1;
     pub const MIN_SWAP_PAGES: u32 = 10;
+    pub const UUID_LENGTH: usize = 16;
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug)]
     pub enum MkswapError {
         TooLongLabel,
         TooFewPages { pages: u32 },
@@ -65,6 +66,7 @@ mod linux {
             }
         }
     }
+
     impl std::error::Error for MkswapError {}
 
     #[repr(C)]
@@ -73,7 +75,7 @@ mod linux {
         version: u32,
         last_page: u32,
         nr_badpages: u32,
-        uuid: [c_uchar; 16],
+        uuid: [c_uchar; UUID_LENGTH],
         label: [c_uchar; SWAP_LABEL_LENGTH],
         padding: [u32; 117],
         badpages: [u32; 1],
@@ -123,11 +125,13 @@ mod linux {
             pagesize: usize,
         ) -> Result<Self, MkswapError> {
             self.nr_badpages = (badpages.len() as u32).saturating_sub(1);
+            // max amount of badpages that fit in the header
             let max_badpages = (pagesize
-                - 1024 * size_of::<u8>()
-                - 120 * size_of::<i32>()
-                - 32 * size_of::<u8>()
-                - SWAP_SIGNATURE_SZ)
+                - 1024 * size_of::<u8>() // bootbits
+                - 120 * size_of::<i32>() // padding + nr_badpages + version
+		- SWAP_LABEL_LENGTH * size_of::<u8>()
+		- UUID_LENGTH * size_of::<u8>()
+		- SWAP_SIGNATURE_SZ * size_of::<usize>())
                 / size_of::<i32>();
 
             if self.nr_badpages > max_badpages as u32 {
@@ -158,7 +162,7 @@ mod linux {
                 let err = unsafe { ioctl(fd.as_raw_fd(), BLKGETSIZE64 as u64, &mut sz) };
 
                 if sz == 0 || err < 0 {
-                    let f_size = fs::File::open(format!("/sys/class/block/{devname}/size"))?;
+                    let f_size = File::open(format!("/sys/class/block/{devname}/size"))?;
 
                     let mut reader = BufReader::new(f_size);
                     let mut line = String::new();
@@ -222,7 +226,7 @@ mod linux {
         createflag: bool,
         filesize: u64,
     ) -> Result<File, std::io::Error> {
-        let mut options = fs::OpenOptions::new();
+        let mut options = OpenOptions::new();
         let fd = match options
             .create(false)
             .create_new(createflag)
@@ -241,7 +245,7 @@ mod linux {
         };
 
         if createflag {
-            fd.set_permissions(fs::Permissions::from_mode(0o600))?;
+            fd.set_permissions(Permissions::from_mode(0o600))?;
             fd.set_len(filesize)?;
         }
 
