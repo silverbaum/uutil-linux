@@ -12,7 +12,7 @@ mod linux {
         new_ucmd!()
             .arg("/foo/bar/baz")
             .fails()
-            .code_is(2)
+            .code_is(1)
             .stderr_contains("failed to open /foo/bar/baz: No such file or directory");
     }
 
@@ -22,17 +22,20 @@ mod linux {
         at.mkdir("foo");
         ucmd.arg("foo")
             .fails()
-            .code_is(2)
+            .code_is(1)
             .stderr_contains("failed to open foo: Is a directory");
     }
 
     #[test]
     fn test_invalid_arg() {
-        new_ucmd!().arg("foo").fails().code_is(2);
+        new_ucmd!().arg("foo").fails().code_is(1);
     }
     #[test]
     fn test_empty_args() {
-        new_ucmd!().fails().code_is(2).stderr_contains("Usage:");
+        new_ucmd!()
+            .fails()
+            .code_is(1)
+            .stderr_contains("Nowhere to set up swap on?");
     }
 
     #[test]
@@ -56,12 +59,11 @@ mod linux {
     #[test]
     fn test_swapfile() {
         let (at, mut ucmd) = at_and_ucmd!();
-        at.write_bytes("swap", &[0; 65536]);
-        ucmd.arg("swap")
+        at.write_bytes("swapfile", &[0; 65536]);
+        ucmd.arg("swapfile")
             .succeeds()
             .code_is(0)
-            .stdout_contains("Setting up swapspace version 1")
-            .stderr_contains("insecure file owner");
+            .stdout_contains("Setting up swapspace version 1");
     }
 
     #[test]
@@ -100,7 +102,7 @@ mod linux {
             .arg("-L")
             .arg("OUTRAGEOUSLYLONGSWAPLABEL")
             .fails()
-            .code_is(2)
+            .code_is(1)
             .stderr_contains("Label is too long, maximum size is 16 characters");
     }
 
@@ -114,7 +116,7 @@ mod linux {
             .arg("-u")
             .arg("078d9a95+4c1e-4961-b8a5-3f9d27586645")
             .fails()
-            .code_is(2)
+            .code_is(1)
             .stderr_contains("Invalid UUID '078d9a95+4c1e-4961-b8a5-3f9d27586645':");
     }
 
@@ -142,6 +144,17 @@ mod linux {
     }
 
     #[test]
+    fn test_negative_filesize() {
+        new_ucmd!()
+            .arg("-F")
+            .arg("test_swapfile")
+            .arg("-s=-1")
+            .fails()
+            .code_is(1)
+            .stderr_contains("invalid value");
+    }
+
+    #[test]
     fn test_missing_required_args() {
         new_ucmd!()
             .arg("-F")
@@ -151,7 +164,46 @@ mod linux {
             .stderr_contains("the following required arguments were not provided:")
             .stderr_contains("--size");
     }
+
+    #[test]
+    fn test_bad_page_size() {
+        new_ucmd!()
+            .arg("-F")
+            .arg("test_swapfile")
+            .arg("-s")
+            .arg("65535")
+            .arg("-p")
+            .arg("4000")
+            .fails()
+            .code_is(1)
+            .stderr_contains("Bad user-specified page size 4000");
+    }
+
+    #[test]
+    fn test_too_small_page_size() {
+        new_ucmd!()
+            .arg("-F")
+            .arg("test_swapfile")
+            .arg("-s")
+            .arg("65535")
+            .arg("-p")
+            .arg("512")
+            .fails()
+            .code_is(1)
+            .stderr_contains("Bad user-specified page size 512");
+        new_ucmd!()
+            .arg("-F")
+            .arg("-s")
+            .arg("65535")
+            .arg("-p=-1")
+            .fails()
+            .code_is(1)
+            .stderr_contains(
+                "invalid value '-1' for '--pagesize <pagesize>': invalid digit found in string",
+            );
+    }
 }
+
 #[cfg(not(target_os = "linux"))]
 mod non_linux {
     use uutests::new_ucmd;
