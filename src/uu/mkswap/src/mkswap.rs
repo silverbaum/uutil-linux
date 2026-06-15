@@ -13,6 +13,8 @@ const USAGE: &str = help_usage!("mkswap.md");
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use core::ffi::{c_char, c_uchar, c_void};
+    use linux_raw_sys::ioctl::BLKGETSIZE64;
     use std::{
         fmt::Debug,
         fs::{File, Metadata, OpenOptions, Permissions},
@@ -21,26 +23,23 @@ mod linux {
         os::{
             fd::AsRawFd,
             linux::fs::MetadataExt,
-            raw::{c_char, c_uchar, c_void},
             unix::fs::{FileTypeExt, PermissionsExt},
         },
         path::Path,
         str::FromStr,
     };
-
-    use linux_raw_sys::ioctl::BLKGETSIZE64;
     use uucore::{
         error::UUsageError,
         libc::{geteuid, ioctl, pread, sysconf, _SC_PAGESIZE, _SC_PAGE_SIZE},
     };
     use uuid::Uuid;
 
-    pub const SWAP_SIGNATURE: &[u8] = "SWAPSPACE2".as_bytes();
-    pub const SWAP_SIGNATURE_SZ: usize = SWAP_SIGNATURE.len();
-    pub const SWAP_LABEL_LENGTH: usize = 16;
-    pub const SWAP_VERSION: u32 = 1;
-    pub const MIN_SWAP_PAGES: u32 = 10;
-    pub const UUID_LENGTH: usize = 16;
+    const SWAP_SIGNATURE: &[u8] = "SWAPSPACE2".as_bytes();
+    const SWAP_SIGNATURE_SZ: usize = SWAP_SIGNATURE.len();
+    const SWAP_LABEL_LENGTH: usize = 16;
+    const SWAP_VERSION: u32 = 1;
+    const MIN_SWAP_PAGES: u32 = 10;
+    const SWAP_UUID_LENGTH: usize = 16;
 
     #[derive(Debug)]
     pub enum MkswapError {
@@ -75,7 +74,7 @@ mod linux {
         version: u32,
         last_page: u32,
         nr_badpages: u32,
-        uuid: [c_uchar; UUID_LENGTH],
+        uuid: [c_uchar; SWAP_UUID_LENGTH],
         label: [c_uchar; SWAP_LABEL_LENGTH],
         padding: [u32; 117],
         badpages: [u32; 1],
@@ -84,13 +83,13 @@ mod linux {
     impl SwapHeader {
         pub fn new() -> Self {
             Self {
-                bootbits: [0i8; 1024],
+                bootbits: [0; 1024],
                 version: SWAP_VERSION,
                 last_page: 0,
                 nr_badpages: 0,
-                uuid: [0u8; 16],
-                label: [0u8; SWAP_LABEL_LENGTH],
-                padding: [0u32; 117],
+                uuid: [0; SWAP_UUID_LENGTH],
+                label: [0; SWAP_LABEL_LENGTH],
+                padding: [0; 117],
                 badpages: [0],
             }
         }
@@ -122,18 +121,25 @@ mod linux {
             Ok(self)
         }
 
-        pub fn bad_pages(mut self, badpages: &[u32], pagesize: usize) -> Result<Self, MkswapError> {
-            self.nr_badpages = badpages.len() as u32;
-            // max amount of badpages that fit in the header
-            let max_badpages = (pagesize
+        /// calculates maximum amount of badpages that can fit in the signature page
+        /// returns the space between start of badpages and swap signature in usize
+        pub fn max_badpages(pagesize: usize) -> usize {
+            let pagesize_bytes = pagesize * size_of::<usize>();
+
+            (pagesize_bytes
                 - 1024 * size_of::<u8>() // bootbits
                 - 120 * size_of::<i32>() // padding + nr_badpages + version
 		- SWAP_LABEL_LENGTH * size_of::<u8>()
-		- UUID_LENGTH * size_of::<u8>()
+		- SWAP_UUID_LENGTH * size_of::<u8>()
 		- SWAP_SIGNATURE_SZ * size_of::<u8>())
-                / size_of::<i32>();
+                / size_of::<usize>()
+        }
 
-            if self.nr_badpages > max_badpages as u32 {
+        pub fn bad_pages(mut self, badpages: &[u32], pagesize: usize) -> Result<Self, MkswapError> {
+            self.nr_badpages = badpages.len() as u32;
+            let max_badpages = SwapHeader::max_badpages(pagesize);
+
+            if self.nr_badpages as usize > max_badpages {
                 return Err(MkswapError::MaxBadPagesExceeded { max_badpages });
             }
 
@@ -141,6 +147,7 @@ mod linux {
         }
     }
 
+    /// Retrieves system page size with ioctl
     fn getpagesize() -> Result<usize, std::io::Error> {
         // both variable names are defined in POSIX and should work, but try both just in case
         let mut sz = unsafe { sysconf(_SC_PAGESIZE) };
@@ -153,10 +160,16 @@ mod linux {
                 "Failed to determine page size, please check your system configuration",
             ))
         } else {
-            Ok(sz as usize)
+            TryInto::<usize>::try_into(sz as u64).map_err(|_| {
+                std::io::Error::other(format!(
+                    "Page size too large, max page size: {}",
+                    usize::MAX
+                ))
+            })
         }
     }
 
+    /// Get the size of a file or block device from a file descriptor
     fn getsize(fd: &File, stat: &Metadata, devname: &str) -> Result<u64, std::io::Error> {
         if !stat.file_type().is_block_device() {
             return Ok(stat.st_size());
@@ -183,11 +196,11 @@ mod linux {
                 ))
             })?;
 
-            // size from /sys/class is in 512 byte sectors
+            // get size in bytes by multiplying value from /sys/class, which is in 512 byte sectors
             match sectors.checked_mul(512) {
                 Some(sz) => Ok(sz),
                 None => Err(std::io::Error::other(
-                    "Integer overflow while trying to determine size of block device",
+                    "Unable to determine size of block device",
                 )),
             }
         } else {
@@ -195,6 +208,7 @@ mod linux {
         }
     }
 
+    /// Check device for holes
     fn check_device(
         fd: &File,
         pagesize: usize,
@@ -229,8 +243,7 @@ mod linux {
         createflag: bool,
         filesize: u64,
     ) -> Result<File, std::io::Error> {
-        let mut options = OpenOptions::new();
-        let fd = match options
+        let fd = match OpenOptions::new()
             .create(createflag)
             .write(true)
             .read(true)
@@ -247,15 +260,15 @@ mod linux {
         };
 
         if createflag {
+            // TODO: check for existing filesystem signatures and set NOCOW flag for swapfiles to work on btrfs
             fd.set_permissions(Permissions::from_mode(0o600))?;
             fd.set_len(filesize)?;
         }
-        // TODO: check for existing swap signature
 
         Ok(fd)
     }
 
-    fn write_signature_page(
+    fn init_signature_page(
         pagesize: usize,
         pages: u32,
         uuid: Uuid,
@@ -286,7 +299,12 @@ mod linux {
                     badpages.len() * size_of::<u32>(),
                 )
             };
-            buf[header_bytes.len()..pagesize].copy_from_slice(badpages_bytes);
+            let badpages_offset = pagesize
+                - (SwapHeader::max_badpages(pagesize) * size_of::<u32>())
+                - SWAP_SIGNATURE_SZ;
+            let badpages_n_bytes = badpages.len() * size_of::<u32>();
+            buf[badpages_offset..badpages_offset + badpages_n_bytes]
+                .copy_from_slice(badpages_bytes);
         }
         buf[pagesize - SWAP_SIGNATURE_SZ..].copy_from_slice(SWAP_SIGNATURE);
         Ok(buf)
@@ -296,13 +314,7 @@ mod linux {
         let verbose = matches.get_flag("verbose");
         let checkflag = matches.get_flag("check");
         let createflag = matches.get_flag("file");
-        let pagesize_arg = matches
-            .try_get_one::<usize>("pagesize")
-            .map_err(|e| USimpleError {
-                code: 1,
-                message: e.to_string(),
-            })?;
-        let filesize = *matches.get_one::<u64>("filesize").unwrap_or(&0);
+        let forceflag = matches.get_flag("force");
 
         let device = match matches.get_one::<String>("device") {
             Some(str) => str,
@@ -310,8 +322,6 @@ mod linux {
                 return Err(UUsageError::new(
                     1,
                     format!(
-                        //"Usage: {}\nFor more information, try '--help'.",
-                        //format_usage(USAGE)
                         "error: Nowhere to set up swap on?\n Try '{} --help' for more information.",
                         uucore::util_name()
                     ),
@@ -319,17 +329,34 @@ mod linux {
             }
         };
 
-        let pagesize = match pagesize_arg {
-            Some(sz) => {
-                if *sz <= size_of::<SwapHeader>() || !sz.is_power_of_two() {
-                    return Err(USimpleError::new(
-                        1,
-                        format!("Bad user-specified page size {}", *sz),
-                    ));
+        let pagesize_arg = matches
+            .try_get_one::<usize>("pagesize")
+            .map_err(|e| USimpleError {
+                code: 1,
+                message: e.to_string(),
+            })?;
+        let pagesize = {
+            let sys_pagesize: usize = getpagesize()?;
+
+            match pagesize_arg {
+                Some(sz) => {
+                    if !forceflag && (*sz <= size_of::<SwapHeader>() || !sz.is_power_of_two()) {
+                        return Err(USimpleError::new(
+                            1,
+                            format!("Bad user-specified page size {}", *sz),
+                        ));
+                    }
+
+                    if *sz != sys_pagesize {
+                        eprintln!(
+                            "Using user-specified page size {}, instead of the system value {}",
+                            *sz, sys_pagesize
+                        );
+                    }
+                    *sz
                 }
-                *sz
+                None => sys_pagesize,
             }
-            None => getpagesize()?,
         };
 
         let label = match matches.get_one::<String>("label") {
@@ -345,8 +372,9 @@ mod linux {
                 device.strip_prefix("/dev/").unwrap_or(device)
             }
         };
-        let mut fd = open_device(device, dev, createflag, filesize)?;
 
+        let filesize = *matches.get_one::<u64>("filesize").unwrap_or(&0);
+        let mut fd = open_device(device, dev, createflag, filesize)?;
         let stat = fd.metadata()?;
         if stat.st_uid() != 0 && unsafe { geteuid() } == 0 {
             eprintln!(
@@ -374,17 +402,33 @@ mod linux {
             })?
         };
 
-        let pages: u32 = (devsize / pagesize as u64)
-            .try_into()
-            .expect("Too many pages, overflows u32");
+        let min_swapsize_kib = (MIN_SWAP_PAGES * pagesize as u32) / 1024;
+        if devsize / 1024 < min_swapsize_kib as u64 {
+            return Err(USimpleError::new(
+                1,
+                format!(
+                    "error: swap area needs to be at least {} KiB",
+                    min_swapsize_kib
+                ),
+            ));
+        }
+
+        let pages: u32 = match (devsize / pagesize as u64).try_into() {
+            Ok(p) => p,
+            Err(_) => {
+                return Err(USimpleError::new(
+                    1,
+                    format!("{} is too large: max size is {} bytes", devname, u32::MAX),
+                ))
+            }
+        };
 
         if pages < MIN_SWAP_PAGES {
             return Err(USimpleError::new(
                 1,
                 format!(
                     "Device {} is too small for a swap area, minimum size is {}KiB",
-                    devname,
-                    (MIN_SWAP_PAGES * pagesize as u32) / 1024
+                    devname, min_swapsize_kib
                 ),
             ));
         }
@@ -395,7 +439,7 @@ mod linux {
             vec![]
         };
 
-        let buf = match write_signature_page(pagesize, pages, uuid, label, badpages) {
+        let buf = match init_signature_page(pagesize, pages, uuid, label, badpages) {
             Ok(buffer) => buffer,
             Err(MkswapError::TooFewPages { pages: _ }) => {
                 return Err(USimpleError::new(
@@ -426,7 +470,7 @@ mod linux {
         fd.sync_all()?;
 
         println!(
-            "Setting up swapspace version 1, size = {}KiB ({} bytes)\n{}{}, UUID={}",
+            "Setting up swapspace version 1, size = {} KiB ({} bytes)\n{}{}, UUID={}",
             (pages - 1) as usize * (pagesize / 1024),
             (pages - 1) as usize * pagesize,
             if label.is_empty() {
@@ -434,7 +478,7 @@ mod linux {
             } else {
                 "LABEL="
             },
-            &label[..label.len().min(16)],
+            &label[..label.floor_char_boundary(SWAP_LABEL_LENGTH)],
             uuid
         );
 
@@ -503,7 +547,7 @@ pub fn uu_app() -> Command {
                 .value_parser(clap::value_parser!(u64))
                 .value_name("SIZE")
                 .requires("file")
-                .help("size of the swap file in bytes"),
+                .help("specify the size of the swap file in bytes"),
         )
         .arg(
             Arg::new("verbose")
@@ -527,5 +571,13 @@ pub fn uu_app() -> Command {
                 .value_parser(clap::value_parser!(usize))
                 .help("specify page size in bytes"),
         )
-    // TODO: endianness, offset, force, lock
+        .arg(
+            Arg::new("force")
+                .short('f')
+                .long("force")
+                .action(ArgAction::SetTrue)
+                .help("allow swap size area to be larger than device"),
+        )
+
+    // TODO: endianness, offset, lock
 }

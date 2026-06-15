@@ -44,7 +44,7 @@ mod linux {
         at.touch("empty");
         ucmd.arg("empty")
             .fails()
-            .stderr_contains("is too small for a swap area");
+            .stderr_contains("swap area needs to be at least");
     }
 
     #[test]
@@ -53,7 +53,7 @@ mod linux {
         at.write_bytes("swap", &[0; 4096]);
         ucmd.arg("swap")
             .fails()
-            .stderr_contains("is too small for a swap area");
+            .stderr_contains("swap area needs to be at least");
     }
 
     #[test]
