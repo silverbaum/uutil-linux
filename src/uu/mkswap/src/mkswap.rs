@@ -16,7 +16,7 @@ mod linux {
     use core::ffi::{c_char, c_uchar, c_void};
     use linux_raw_sys::ioctl::BLKGETSIZE64;
     use std::{
-        fmt::Debug,
+        fmt::{Debug, Display},
         fs::{File, Metadata, OpenOptions, Permissions},
         io::{BufRead, BufReader, Write},
         mem::size_of,
@@ -42,13 +42,20 @@ mod linux {
     const SWAP_UUID_LENGTH: usize = 16;
 
     #[derive(Debug)]
-    pub enum MkswapError {
+    enum MkswapError {
         TooLongLabel,
         TooFewPages { pages: u32 },
         MaxBadPagesExceeded { max_badpages: usize },
     }
 
-    impl std::fmt::Display for MkswapError {
+    #[derive(Clone, Copy)]
+    enum Endian {
+        Native,
+        Little,
+        Big,
+    }
+
+    impl Display for MkswapError {
         fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             match self {
                 Self::TooLongLabel => write!(
@@ -69,7 +76,7 @@ mod linux {
     impl std::error::Error for MkswapError {}
 
     #[repr(C)]
-    pub struct SwapHeader {
+    struct SwapHeader {
         bootbits: [c_char; 1024],
         version: u32,
         last_page: u32,
@@ -81,7 +88,7 @@ mod linux {
     }
 
     impl SwapHeader {
-        pub fn new() -> Self {
+        fn new() -> Self {
             Self {
                 bootbits: [0; 1024],
                 version: SWAP_VERSION,
@@ -94,7 +101,7 @@ mod linux {
             }
         }
 
-        pub fn label(mut self, swaplabel: String) -> Result<Self, MkswapError> {
+        fn label(mut self, swaplabel: &str) -> Result<Self, MkswapError> {
             if swaplabel.len() > SWAP_LABEL_LENGTH {
                 return Err(MkswapError::TooLongLabel);
             }
@@ -105,12 +112,12 @@ mod linux {
             Ok(self)
         }
 
-        pub fn uuid(mut self, uuid: Uuid) -> Self {
+        fn uuid(mut self, uuid: Uuid) -> Self {
             self.uuid = *uuid.as_bytes();
             self
         }
 
-        pub fn last_page(mut self, pages: u32) -> Result<Self, MkswapError> {
+        fn last_page(mut self, pages: u32) -> Result<Self, MkswapError> {
             if pages < MIN_SWAP_PAGES {
                 return Err(MkswapError::TooFewPages { pages });
             }
@@ -123,20 +130,19 @@ mod linux {
 
         /// calculates maximum amount of badpages that can fit in the signature page
         /// returns the space between start of badpages and swap signature in usize
-        pub fn max_badpages(pagesize: usize) -> usize {
-            let pagesize_bytes = pagesize * size_of::<usize>();
-
-            (pagesize_bytes
+        fn max_badpages(pagesize: usize) -> usize {
+            (pagesize
                 - 1024 * size_of::<u8>() // bootbits
-                - 120 * size_of::<i32>() // padding + nr_badpages + version
+                - 120 * size_of::<u32>() // version + last_page + nr_badpages + padding
 		- SWAP_LABEL_LENGTH * size_of::<u8>()
 		- SWAP_UUID_LENGTH * size_of::<u8>()
 		- SWAP_SIGNATURE_SZ * size_of::<u8>())
-                / size_of::<usize>()
+                / size_of::<u32>()
         }
 
-        pub fn bad_pages(mut self, badpages: &[u32], pagesize: usize) -> Result<Self, MkswapError> {
+        fn bad_pages(mut self, badpages: &[u32], pagesize: usize) -> Result<Self, MkswapError> {
             self.nr_badpages = badpages.len() as u32;
+
             let max_badpages = SwapHeader::max_badpages(pagesize);
 
             if self.nr_badpages as usize > max_badpages {
@@ -145,13 +151,31 @@ mod linux {
 
             Ok(self)
         }
+
+        fn set_endian(mut self, endianness: Endian) -> Self {
+            use linux::Endian;
+            match endianness {
+                Endian::Big => {
+                    self.version = self.version.to_be();
+                    self.nr_badpages = self.nr_badpages.to_be();
+                    self.last_page = self.last_page.to_be();
+                }
+                Endian::Little => {
+                    self.version = self.version.to_le();
+                    self.nr_badpages = self.nr_badpages.to_le();
+                    self.last_page = self.last_page.to_le();
+                }
+                Endian::Native => (),
+            }
+            self
+        }
     }
 
     /// Retrieves system page size with ioctl
     fn getpagesize() -> Result<usize, std::io::Error> {
         // both variable names are defined in POSIX and should work, but try both just in case
         let mut sz = unsafe { sysconf(_SC_PAGESIZE) };
-        if sz <= 1 {
+        if sz <= 0 {
             sz = unsafe { sysconf(_SC_PAGE_SIZE) };
         }
 
@@ -197,7 +221,7 @@ mod linux {
             })?;
 
             // get size in bytes by multiplying value from /sys/class, which is in 512 byte sectors
-            match sectors.checked_mul(512) {
+            match sectors.checked_shl(9) {
                 Some(sz) => Ok(sz),
                 None => Err(std::io::Error::other(
                     "Unable to determine size of block device",
@@ -238,7 +262,7 @@ mod linux {
     }
 
     fn open_device(
-        device: &String,
+        device: &str,
         dev: &Path,
         createflag: bool,
         filesize: u64,
@@ -268,20 +292,22 @@ mod linux {
         Ok(fd)
     }
 
-    fn init_signature_page(
+    fn get_signature_page(
         pagesize: usize,
         pages: u32,
         uuid: Uuid,
         label: &str,
         badpages: Vec<u32>,
+        endianness: Endian,
     ) -> Result<Vec<u8>, MkswapError> {
         let mut buf = vec![0u8; pagesize];
 
         let header = SwapHeader::new()
-            .label(label.to_owned())?
+            .label(label)?
             .last_page(pages)?
             .bad_pages(&badpages, pagesize)?
-            .uuid(uuid);
+            .uuid(uuid)
+            .set_endian(endianness);
 
         let header_bytes = unsafe {
             std::slice::from_raw_parts(
@@ -299,9 +325,7 @@ mod linux {
                     badpages.len() * size_of::<u32>(),
                 )
             };
-            let badpages_offset = pagesize
-                - (SwapHeader::max_badpages(pagesize) * size_of::<u32>())
-                - SWAP_SIGNATURE_SZ;
+            let badpages_offset = size_of::<SwapHeader>() - size_of::<u32>(); // badpages[0] is last element of header
             let badpages_n_bytes = badpages.len() * size_of::<u32>();
             buf[badpages_offset..badpages_offset + badpages_n_bytes]
                 .copy_from_slice(badpages_bytes);
@@ -315,6 +339,21 @@ mod linux {
         let checkflag = matches.get_flag("check");
         let createflag = matches.get_flag("file");
         let forceflag = matches.get_flag("force");
+
+        let endianness = match matches.get_one::<String>("endianness") {
+            Some(str) => match str.to_lowercase().as_str() {
+                "native" => Endian::Native,
+                "little" => Endian::Little,
+                "big" => Endian::Big,
+                _ => {
+                    return Err(UUsageError::new(
+                        1,
+                        format!("invalid endianness {} is not supported", str),
+                    ));
+                }
+            },
+            None => Endian::Native,
+        };
 
         let device = match matches.get_one::<String>("device") {
             Some(str) => str,
@@ -439,31 +478,8 @@ mod linux {
             vec![]
         };
 
-        let buf = match init_signature_page(pagesize, pages, uuid, label, badpages) {
-            Ok(buffer) => buffer,
-            Err(MkswapError::TooFewPages { pages: _ }) => {
-                return Err(USimpleError::new(
-                    1,
-                    format!(
-                        "Device {} is too small for a swap area, minimum size is {}KiB",
-                        devname,
-                        (MIN_SWAP_PAGES * pagesize as u32) / 1024
-                    ),
-                ));
-            }
-            Err(MkswapError::TooLongLabel) => {
-                return Err(USimpleError::new(
-                    1,
-                    format!("{}", MkswapError::TooLongLabel),
-                ));
-            }
-            Err(MkswapError::MaxBadPagesExceeded { max_badpages: e }) => {
-                return Err(USimpleError::new(
-                    1,
-                    format!("{}", MkswapError::MaxBadPagesExceeded { max_badpages: (e) }),
-                ));
-            }
-        };
+        let buf = get_signature_page(pagesize, pages, uuid, label, badpages, endianness)
+            .map_err(|e| USimpleError::new(1, e.to_string()))?;
 
         fd.write_all(&buf)?;
         fd.flush()?;
@@ -502,7 +518,6 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let _matches: ArgMatches = uu_app().try_get_matches_from(args)?;
-
     Err(USimpleError::new(1, "`mkswap` is available only on Linux."))
 }
 
@@ -577,6 +592,14 @@ pub fn uu_app() -> Command {
                 .long("force")
                 .action(ArgAction::SetTrue)
                 .help("allow swap size area to be larger than device"),
+        )
+        .arg(
+            Arg::new("endianness")
+                .short('e')
+                .long("endianness")
+                .action(ArgAction::Set)
+                .value_parser(clap::value_parser!(String))
+                .help("specify the endianness to use (native, little, or big)"),
         )
 
     // TODO: endianness, offset, lock

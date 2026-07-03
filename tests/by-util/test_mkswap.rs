@@ -30,6 +30,7 @@ mod linux {
     fn test_invalid_arg() {
         new_ucmd!().arg("foo").fails().code_is(1);
     }
+
     #[test]
     fn test_empty_args() {
         new_ucmd!()
@@ -59,7 +60,7 @@ mod linux {
     #[test]
     fn test_swapfile() {
         let (at, mut ucmd) = at_and_ucmd!();
-        at.write_bytes("swapfile", &[0; 65536]);
+        at.write_bytes("swapfile", &[0; 40960]);
         ucmd.arg("swapfile")
             .succeeds()
             .code_is(0)
@@ -69,7 +70,7 @@ mod linux {
     #[test]
     fn test_swaplabel() {
         let (at, mut ucmd) = at_and_ucmd!();
-        at.write_bytes("swap", &[0; 65536]);
+        at.write_bytes("swap", &[0; 40960]);
         ucmd.arg("swap")
             .arg("-L")
             .arg("SWAPLABEL")
@@ -82,7 +83,7 @@ mod linux {
     #[test]
     fn test_custom_uuid() {
         let (at, mut ucmd) = at_and_ucmd!();
-        at.write_bytes("swap", &[0; 65536]);
+        at.write_bytes("swap", &[0; 40960]);
         ucmd.arg("swap")
             .arg("-L")
             .arg("SWAP")
@@ -97,7 +98,7 @@ mod linux {
     #[test]
     fn test_long_label() {
         let (at, mut ucmd) = at_and_ucmd!();
-        at.write_bytes("swap", &[0; 65536]);
+        at.write_bytes("swap", &[0; 40960]);
         ucmd.arg("swap")
             .arg("-L")
             .arg("OUTRAGEOUSLYLONGSWAPLABEL")
@@ -109,7 +110,7 @@ mod linux {
     #[test]
     fn test_invalid_uuid() {
         let (at, mut ucmd) = at_and_ucmd!();
-        at.write_bytes("swap", &[0; 65536]);
+        at.write_bytes("swap", &[0; 40960]);
         ucmd.arg("swap")
             .arg("-L")
             .arg("SWAP")
@@ -127,7 +128,7 @@ mod linux {
         ucmd.arg("swapfile")
             .arg("-F")
             .arg("-s")
-            .arg("65535")
+            .arg("40960")
             .succeeds()
             .code_is(0)
             .stdout_contains("Setting up swapspace version 1");
@@ -171,7 +172,7 @@ mod linux {
             .arg("-F")
             .arg("test_swapfile")
             .arg("-s")
-            .arg("65535")
+            .arg("40960")
             .arg("-p")
             .arg("4000")
             .fails()
@@ -185,7 +186,7 @@ mod linux {
             .arg("-F")
             .arg("test_swapfile")
             .arg("-s")
-            .arg("65535")
+            .arg("40960")
             .arg("-p")
             .arg("512")
             .fails()
@@ -194,13 +195,47 @@ mod linux {
         new_ucmd!()
             .arg("-F")
             .arg("-s")
-            .arg("65535")
+            .arg("40960")
             .arg("-p=-1")
             .fails()
             .code_is(1)
             .stderr_contains(
                 "invalid value '-1' for '--pagesize <pagesize>': invalid digit found in string",
             );
+    }
+
+    #[test]
+    fn test_endianness_big() {
+        use std::io::Read;
+        let (at, mut ucmd) = at_and_ucmd!();
+        ucmd.arg("swapfile")
+            .arg("--pagesize")
+            .arg("4096")
+            .arg("-F")
+            .arg("-s")
+            .arg("40960") // 10 pages
+            .arg("--endianness")
+            .arg("big")
+            .succeeds()
+            .code_is(0);
+        at.file_exists("swapfile");
+
+        let mut buf = vec![0u8; 4096];
+        let mut fd = at.open("swapfile");
+        fd.read_exact(&mut buf).unwrap();
+
+        {
+            let be_version = 1u32.to_be();
+            let version = u32::from_ne_bytes(buf[1024..1028].try_into().unwrap());
+            assert_eq!(be_version, version);
+        }
+
+        {
+            const PAGES: u32 = 10;
+            let be_last_page = (PAGES - 1).to_be();
+            let last_page = u32::from_ne_bytes(buf[1028..1032].try_into().unwrap());
+            assert_eq!(be_last_page, last_page);
+        }
     }
 }
 
