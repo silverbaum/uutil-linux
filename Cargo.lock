@@ -1724,6 +1724,7 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "linux-raw-sys",
+ "nix 0.31.3",
  "uucore 0.2.2",
  "uuid",
 ]

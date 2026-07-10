@@ -7,13 +7,21 @@
 mod linux {
     use uutests::{at_and_ucmd, new_ucmd};
 
+    const SWAP_SIGNATURE: &[u8] = "SWAPSPACE2".as_bytes();
+
+    const SWAP_VERSION: u32 = 1;
+    const SWAP_VERSION_OFFSET: usize = 1024;
+
+    const SWAP_UUID_LENGTH: usize = 16;
+    const SWAP_UUID_OFFSET: usize = 1036;
+
     #[test]
     fn test_invalid_path() {
         new_ucmd!()
-            .arg("/foo/bar/baz")
+            .arg("foobar/barfoo/bazoo")
             .fails()
             .code_is(1)
-            .stderr_contains("failed to open /foo/bar/baz: No such file or directory");
+            .stderr_contains("cannot open foobar/barfoo/bazoo: No such file or directory");
     }
 
     #[test]
@@ -23,7 +31,7 @@ mod linux {
         ucmd.arg("foo")
             .fails()
             .code_is(1)
-            .stderr_contains("failed to open foo: Is a directory");
+            .stderr_contains("cannot open foo: Is a directory");
     }
 
     #[test]
@@ -58,47 +66,60 @@ mod linux {
     }
 
     #[test]
-    fn test_swapfile() {
+    fn test_existing_file() {
         let (at, mut ucmd) = at_and_ucmd!();
         at.write_bytes("swapfile", &[0; 40960]);
         ucmd.arg("swapfile")
             .succeeds()
             .code_is(0)
             .stdout_contains("Setting up swapspace version 1");
+        let buf = at.read_bytes("swapfile");
+
+        let buf_version = u32::from_ne_bytes(buf[1024..1028].try_into().unwrap());
+        assert_eq!(SWAP_VERSION, buf_version);
     }
 
     #[test]
     fn test_swaplabel() {
         let (at, mut ucmd) = at_and_ucmd!();
-        at.write_bytes("swap", &[0; 40960]);
-        ucmd.arg("swap")
+        at.write_bytes("swap_label_test", &[0; 40960]);
+        ucmd.arg("swap_label_test")
             .arg("-L")
             .arg("SWAPLABEL")
             .succeeds()
             .code_is(0)
-            .stdout_contains("LABEL=SWAPLABEL,")
+            .stdout_contains("LABEL=SWAPLABEL")
             .stdout_contains("Setting up swapspace version 1");
+
+        let buf = at.read_bytes("swap_label_test");
+        assert_eq!(&buf[1052..1061], b"SWAPLABEL")
     }
 
     #[test]
     fn test_custom_uuid() {
         let (at, mut ucmd) = at_and_ucmd!();
-        at.write_bytes("swap", &[0; 40960]);
-        ucmd.arg("swap")
+        at.write_bytes("swap_uuid_test", &[0; 40960]);
+        ucmd.arg("swap_uuid_test")
             .arg("-L")
             .arg("SWAP")
-            .arg("-u")
+            .arg("-U")
             .arg("4adbb628-19fa-4bef-9c60-8ce030381672")
             .succeeds()
             .code_is(0)
             .stdout_contains("LABEL=SWAP, UUID=4adbb628-19fa-4bef-9c60-8ce030381672")
             .stdout_contains("Setting up swapspace version 1");
+
+        let buf = at.read_bytes("swap_uuid_test");
+        assert_eq!(
+            &buf[SWAP_UUID_OFFSET..SWAP_UUID_OFFSET + SWAP_UUID_LENGTH],
+            [74, 219, 182, 40, 25, 250, 75, 239, 156, 96, 140, 224, 48, 56, 22, 114]
+        );
     }
 
     #[test]
     fn test_long_label() {
         let (at, mut ucmd) = at_and_ucmd!();
-        at.write_bytes("swap", &[0; 40960]);
+        at.write_bytes("mkswap_test_long_label", &[0; 40960]);
         ucmd.arg("swap")
             .arg("-L")
             .arg("OUTRAGEOUSLYLONGSWAPLABEL")
@@ -110,11 +131,11 @@ mod linux {
     #[test]
     fn test_invalid_uuid() {
         let (at, mut ucmd) = at_and_ucmd!();
-        at.write_bytes("swap", &[0; 40960]);
-        ucmd.arg("swap")
+        at.write_bytes("mkswap_invalid_uuid", &[0; 40960]);
+        ucmd.arg("mkswap_invalid_uuid")
             .arg("-L")
             .arg("SWAP")
-            .arg("-u")
+            .arg("-U")
             .arg("078d9a95+4c1e-4961-b8a5-3f9d27586645")
             .fails()
             .code_is(1)
@@ -125,23 +146,23 @@ mod linux {
     fn test_create_file() {
         use std::io::Read;
         let (at, mut ucmd) = at_and_ucmd!();
-        ucmd.arg("swapfile")
+        ucmd.arg("mkswap_create_file")
             .arg("-F")
             .arg("-s")
             .arg("40960")
             .succeeds()
             .code_is(0)
             .stdout_contains("Setting up swapspace version 1");
-        at.file_exists("swapfile");
+        assert!(at.file_exists("mkswap_create_file"));
 
         let mut buf = vec![0u8; 4096];
-
-        let mut fd = at.open("swapfile");
-        fd.read_exact(&mut buf).unwrap();
+        {
+            let mut fd = at.open("mkswap_create_file");
+            fd.read_exact(&mut buf).unwrap();
+        }
 
         let sig = &buf[4086..];
-        let swapsig = "SWAPSPACE2".as_bytes();
-        assert_eq!(sig, swapsig);
+        assert_eq!(SWAP_SIGNATURE, sig);
     }
 
     #[test]
@@ -208,7 +229,7 @@ mod linux {
     fn test_endianness_big() {
         use std::io::Read;
         let (at, mut ucmd) = at_and_ucmd!();
-        ucmd.arg("swapfile")
+        ucmd.arg("swapfile_endianness_test")
             .arg("--pagesize")
             .arg("4096")
             .arg("-F")
@@ -218,24 +239,54 @@ mod linux {
             .arg("big")
             .succeeds()
             .code_is(0);
-        at.file_exists("swapfile");
+        assert!(at.file_exists("swapfile_endianness_test"));
 
-        let mut buf = vec![0u8; 4096];
-        let mut fd = at.open("swapfile");
+        let mut buf = [0u8; 4096];
+        {
+            let mut fd = at.open("swapfile_endianness_test");
+            fd.read_exact(&mut buf).unwrap();
+        }
+
+        let be_version = 1u32.to_be();
+        let version = u32::from_ne_bytes(
+            buf[SWAP_VERSION_OFFSET..SWAP_VERSION_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(be_version, version);
+
+        const PAGES: u32 = 10;
+        let be_last_page = (PAGES - 1).to_be();
+        let last_page = u32::from_ne_bytes(buf[1028..1032].try_into().unwrap());
+        assert_eq!(be_last_page, last_page);
+    }
+
+    #[test]
+    fn test_offset() {
+        use std::io::Read;
+        let (at, mut ucmd) = at_and_ucmd!();
+        ucmd.arg("mkswap_test_offset")
+            .arg("--pagesize")
+            .arg("4096")
+            .arg("-F")
+            .arg("-s")
+            .arg("45056")
+            .arg("--offset")
+            .arg("4096")
+            .succeeds()
+            .code_is(0);
+
+        let offset: usize = 4096;
+        let mut buf = [0u8; 8192];
+
+        let mut fd = at.open("mkswap_test_offset");
         fd.read_exact(&mut buf).unwrap();
 
-        {
-            let be_version = 1u32.to_be();
-            let version = u32::from_ne_bytes(buf[1024..1028].try_into().unwrap());
-            assert_eq!(be_version, version);
-        }
+        let sig = &buf[4086 + offset..];
+        assert_eq!(SWAP_SIGNATURE, sig);
 
-        {
-            const PAGES: u32 = 10;
-            let be_last_page = (PAGES - 1).to_be();
-            let last_page = u32::from_ne_bytes(buf[1028..1032].try_into().unwrap());
-            assert_eq!(be_last_page, last_page);
-        }
+        let buf_version = u32::from_ne_bytes(buf[1024 + offset..1028 + offset].try_into().unwrap());
+        assert_eq!(SWAP_VERSION, buf_version);
     }
 }
 
