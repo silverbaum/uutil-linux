@@ -258,11 +258,7 @@ mod linux {
 
     // Open and prepare a swap device
     // if createflag is true, sets appropriate permissions and preallocates the file
-    fn open_device(
-        device_path: &Path,
-        createflag: bool,
-        filesize: u64,
-    ) -> io::Result<File> {
+    fn open_device(device_path: &Path, createflag: bool, filesize: u64) -> io::Result<File> {
         let file = match OpenOptions::new()
             .create(createflag)
             .write(true)
@@ -305,12 +301,7 @@ mod linux {
             }
 
             // fallocate to avoid holes in the created file
-            if let Err(e) = fallocate(
-                file.as_fd(),
-                FallocateFlags::empty(),
-                0,
-                filesize as i64,
-            ) {
+            if let Err(e) = fallocate(file.as_fd(), FallocateFlags::empty(), 0, filesize as i64) {
                 return Err(io::Error::other(format!(
                     "{}: {}: Fallocate failed: {}",
                     uucore::util_name(),
