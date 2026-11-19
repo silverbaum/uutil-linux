@@ -32,7 +32,7 @@ const USAGE: &str = help_usage!("lsns.md");
 const PATH_PROC: &str = "/proc";
 const NSNAMES: [&str; 8] = ["cgroup", "ipc", "mnt", "net", "pid", "user", "uts", "time"];
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum NamespaceType {
     Cgroup = 0,
     Ipc = 1,
@@ -85,16 +85,36 @@ struct Lsns {
     processes: Vec<Process>,
     namespaces: Vec<Namespace>,
     noheadings: bool,
+    persistent: bool,
+    namespace_type: Option<NamespaceType>,
+    task: Option<i32>,
 }
 
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let matches = uu_app().try_get_matches_from(args)?;
 
+    let namespace_type = matches
+        .get_one::<String>("type")
+        .map(|s| NamespaceType::try_from(s.as_str()))
+        .transpose()?;
+
+    let task = matches
+        .get_one::<String>("task")
+        .map(|s| {
+            s.parse::<i32>()
+                .map_err(|_| LsnsError::InvalidPidArgument(s.clone()))
+        })
+        .transpose()?;
+
+    // Initialize lsns struct
     let mut lsns = Lsns {
         processes: Vec::new(),
         namespaces: Vec::new(),
         noheadings: matches.get_flag("noheadings"),
+        persistent: matches.get_flag("persistent"),
+        namespace_type,
+        task,
     };
 
     read_processes(PATH_PROC, &mut lsns)?;
@@ -118,6 +138,31 @@ pub fn uu_app() -> Command {
                 .long("noheadings")
                 .action(ArgAction::SetTrue)
                 .help("don't print headings"),
+        )
+        .arg(
+            Arg::new("persistent")
+                .short('P')
+                .long("persistent")
+                .action(ArgAction::SetTrue)
+                .help("namespaces without processes"),
+        )
+        .arg(
+            Arg::new("type")
+                .short('t')
+                .long("type")
+                .action(ArgAction::Set)
+                .required(false)
+                .value_name("name")
+                .help("namespace type (mnt, net, ipc, user, pid, uts, cgroup, time)"),
+        )
+        .arg(
+            Arg::new("task")
+                .short('p')
+                .long("task")
+                .action(ArgAction::Set)
+                .required(false)
+                .value_name("pid")
+                .help("print process namespaces"),
         )
 }
 
@@ -234,16 +279,23 @@ fn get_ns_ino(pid: i32, nsname: &str) -> Result<u64, LsnsError> {
 fn get_process_command(pid: i32) -> String {
     // Try cmdline first (full command with arguments)
     let cmdline_path = format!("/proc/{}/cmdline", pid);
-    if let Ok(content) = fs::read(&cmdline_path) {
-        // cmdline uses null bytes as separators
+    if let Ok(mut content) = fs::read(&cmdline_path) {
+        // cmdline uses null bytes as separators between arguments
         if !content.is_empty() {
-            // Find the first null byte or use entire content
-            let end = content
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(content.len());
-            if end > 0
-                && let Ok(cmd) = String::from_utf8(content[..end].to_vec())
+            // Remove trailing null byte if present
+            if content.last().copied() == Some(0) {
+                content.pop();
+            }
+
+            // Replace null bytes with spaces to show full command line
+            for byte in &mut content {
+                if *byte == 0 {
+                    *byte = b' ';
+                }
+            }
+
+            if !content.is_empty()
+                && let Ok(cmd) = String::from_utf8(content)
             {
                 return cmd;
             }
@@ -483,26 +535,34 @@ impl NamespaceType {
             5 => Ok(NamespaceType::User),
             6 => Ok(NamespaceType::Uts),
             7 => Ok(NamespaceType::Time),
-            _ => Err(LsnsError::InvalidNamespaceType(idx)),
+            _ => Err(LsnsError::InvalidNamespaceType(idx.to_string())),
         }
     }
 }
 
-/// Display namespaces in default format using smartcols
+impl TryFrom<&str> for NamespaceType {
+    type Error = LsnsError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "cgroup" => Ok(NamespaceType::Cgroup),
+            "ipc" => Ok(NamespaceType::Ipc),
+            "mnt" => Ok(NamespaceType::Mnt),
+            "net" => Ok(NamespaceType::Net),
+            "pid" => Ok(NamespaceType::Pid),
+            "user" => Ok(NamespaceType::User),
+            "uts" => Ok(NamespaceType::Uts),
+            "time" => Ok(NamespaceType::Time),
+            _ => Err(LsnsError::InvalidNamespaceType(s.to_string())),
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn display_namespaces(lsns: &Lsns) -> Result<(), LsnsError> {
+fn get_table_with_columns() -> Result<Table, LsnsError> {
     use smartcols_sys::{SCOLS_FL_RIGHT, SCOLS_FL_TRUNC};
 
-    // Initialize smartcols
-    smartcols::initialize();
-
-    // Create table
     let mut table = Table::new()?;
-
-    // Enable or disable headings based on flag
-    if lsns.noheadings {
-        table.enable_headings(false)?;
-    }
 
     // NS: width_hint=10, right-aligned
     table.new_column(c"NS", 10.0, SCOLS_FL_RIGHT)?;
@@ -517,6 +577,29 @@ fn display_namespaces(lsns: &Lsns) -> Result<(), LsnsError> {
     // COMMAND: width_hint=0 (auto-size), truncate if too long
     table.new_column(c"COMMAND", 0.0, SCOLS_FL_TRUNC)?;
 
+    Ok(table)
+}
+
+/// Check if a namespace contains a specific process
+fn namespace_has_process(lsns: &Lsns, ns: &Namespace, pid: i32) -> bool {
+    lsns.processes
+        .iter()
+        .any(|proc| proc.pid == pid && proc.ns_ids[ns.ns_type as usize] == ns.id)
+}
+
+/// Display namespaces in default format using smartcols
+#[cfg(target_os = "linux")]
+fn display_namespaces(lsns: &Lsns) -> Result<(), LsnsError> {
+    // Initialize smartcols
+    smartcols::initialize();
+
+    let mut table = get_table_with_columns()?;
+
+    // Enable or disable headings based on flag
+    if lsns.noheadings {
+        table.enable_headings(false)?;
+    }
+
     // Build username cache once before displaying
     let mut username_cache = HashMap::new();
 
@@ -525,14 +608,32 @@ fn display_namespaces(lsns: &Lsns) -> Result<(), LsnsError> {
 
     // Add each namespace as a row
     for ns in &lsns.namespaces {
-        let mut line = table.new_line(None)?;
+        if lsns.persistent && ns.nprocs != 0 {
+            continue;
+        }
 
-        // Get namespace type name
-        let ns_type = NSNAMES[ns.ns_type as usize];
+        // If --type argument is supplied then show only the specified namespace type
+        if let Some(namespace_type) = &lsns.namespace_type
+            && ns.ns_type != *namespace_type
+        {
+            continue;
+        }
+
+        // If --task argument is supplied then show only the namespaces of the specified process
+        // Note: task_pid == 0 means show all namespaces (no filtering)
+        if let Some(task_pid) = lsns.task
+            && task_pid != 0
+            && !namespace_has_process(lsns, ns, task_pid)
+        {
+            continue;
+        }
 
         // Find representative process using O(1) HashMap lookup
         let rep_pid = ns.representative_pid.unwrap_or(0);
         let rep_proc = process_map.get(&rep_pid).copied();
+
+        // Get namespace type name
+        let ns_type = NSNAMES[ns.ns_type as usize];
 
         // Get user name
         let uid = if let Some(proc) = rep_proc {
@@ -557,6 +658,7 @@ fn display_namespaces(lsns: &Lsns) -> Result<(), LsnsError> {
         let user_str = CString::new(user)?;
         let command_str = CString::new(command)?;
 
+        let mut line = table.new_line(None)?;
         line.set_data(0, &ns_str)?;
         line.set_data(1, &type_str)?;
         line.set_data(2, &nprocs_str)?;

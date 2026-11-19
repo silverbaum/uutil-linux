@@ -157,3 +157,92 @@ fn test_user_column_not_empty() {
         }
     }
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_persistent_flag() {
+    let res = new_ucmd!().arg("--persistent").succeeds();
+    let stdout = res.no_stderr().stdout_str();
+
+    // With --persistent flag, only namespaces without processes should be shown
+    // These are persistent (bind-mounted) namespaces
+    for line in stdout.lines().skip(1) {
+        if !line.is_empty() {
+            let columns: Vec<&str> = line.split_whitespace().collect();
+            if columns.len() >= 3 {
+                // NPROCS column (3rd column) should be 0 for persistent namespaces
+                let nprocs = columns[2];
+                assert_eq!(
+                    nprocs, "0",
+                    "With --persistent flag, NPROCS should be 0 (no processes)"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_type_option() {
+    let res = new_ucmd!().arg("--type").arg("mnt").succeeds();
+    let stdout = res.no_stderr().stdout_str();
+
+    // With --type mnt, only mount namespace should be shown
+    for line in stdout.lines().skip(1) {
+        if !line.is_empty() {
+            let columns: Vec<&str> = line.split_whitespace().collect();
+            if columns.len() >= 2 {
+                assert_eq!(
+                    columns[1], "mnt",
+                    "With --type mnt, only mnt namespace should be shown"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_invalid_namespace_type() {
+    let res = new_ucmd!()
+        .arg("--type")
+        .arg("invalid-namespace-type")
+        .fails();
+    let stdout = res.stderr_str();
+
+    assert!(stdout.contains("lsns: unknown namespace type: invalid-namespace-type"));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_invalid_task_pid() {
+    let res = new_ucmd!().arg("--task").arg("not_a_number").fails();
+    let stderr = res.stderr_str();
+
+    assert!(stderr.contains("invalid PID argument: 'not_a_number'"));
+}
+
+// Write a test to verify that -p 0 part.
+#[test]
+#[cfg(target_os = "linux")]
+fn test_task_pid_0() {
+    let res = new_ucmd!().arg("--task").arg("0").succeeds();
+    let stdout = res.no_stderr().stdout_str();
+
+    // With -p 0, all namespaces should be shown
+    let line = stdout.lines().next().unwrap();
+
+    // Check for all regular headers
+    let columns = line.split_whitespace().count();
+    assert!(
+        columns == 6,
+        "All 6 columns should be displayed when -p 0 is used"
+    );
+
+    // Check for at least one entry
+    let entry_count = stdout.lines().count();
+    assert!(
+        entry_count > 1,
+        "There should be at least one entry when -p 0 is used"
+    );
+}
